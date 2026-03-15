@@ -129,3 +129,63 @@ def test_thinking_prompt_contains_container_id_preference_rule():
     assert "aktive Container mit container_id" in THINKING_PROMPT
     assert "exec_in_container oder container_stats" in THINKING_PROMPT
     assert "container_list nur, wenn keine container_id vorhanden ist" in THINKING_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Tool-Amnesia Fix: needs_memory AUSNAHME-Regel für kontextsensitive Tool-Anfragen
+# ---------------------------------------------------------------------------
+
+def test_thinking_prompt_allows_memory_for_tool_requests_with_context():
+    """THINKING_PROMPT muss explizit erlauben, dass needs_memory=true auch bei
+    Tool-Anfragen gesetzt werden darf, wenn der User auf früheren Kontext verweist.
+    Das verhindert die 'Tool-Amnesie' bei Anfragen wie
+    'starte Container für das Python-Projekt von gestern'."""
+    assert "AUSNAHME" in THINKING_PROMPT, (
+        "Tool-Amnesia Fix fehlt: THINKING_PROMPT muss eine AUSNAHME-Regel enthalten "
+        "die needs_memory=true bei kontextsensitiven Tool-Anfragen erlaubt."
+    )
+    assert "needs_memory: true" in THINKING_PROMPT, (
+        "THINKING_PROMPT muss explizit needs_memory: true als erlaubten Wert zeigen "
+        "auch im Kontext von Tool-Anfragen."
+    )
+
+
+def test_thinking_prompt_has_context_reference_examples():
+    """THINKING_PROMPT muss konkrete Beispiele für Kontext-Referenzen nennen
+    (Zeitbezug, Pronomen, Erinnerungsanker), damit das LLM die AUSNAHME
+    korrekt anwenden kann."""
+    # Zeitbezug-Beispiele
+    assert "von gestern" in THINKING_PROMPT or "gestern" in THINKING_PROMPT, (
+        "THINKING_PROMPT fehlen Zeitbezug-Beispiele (z.B. 'von gestern')."
+    )
+    # Kontext-Anker-Beispiele (Projekt, Script, Setup)
+    assert "Projekt" in THINKING_PROMPT or "Script" in THINKING_PROMPT, (
+        "THINKING_PROMPT fehlen Kontext-Anker-Beispiele (z.B. 'das Projekt', 'mein Script')."
+    )
+
+
+def test_thinking_prompt_pure_tool_action_still_false():
+    """Die Default-Regel bleibt: reine Tool-Anfragen ohne Kontextbezug
+    sollen needs_memory: false setzen. Sicherstellen dass die Ausnahme-Regel
+    die Default-Regel nicht versteckt."""
+    assert "needs_memory: false" in THINKING_PROMPT, (
+        "Default-Regel 'needs_memory: false' für reine Tool-Anfragen fehlt in THINKING_PROMPT."
+    )
+    # Default und Ausnahme müssen beide im Prompt vorhanden sein
+    assert "needs_memory: true" in THINKING_PROMPT, (
+        "Ausnahme-Regel 'needs_memory: true' für kontextsensitive Tool-Anfragen fehlt."
+    )
+
+
+def test_thinking_prompt_tool_amnesia_example_present():
+    """THINKING_PROMPT muss ein konkretes Beispiel für die Ausnahme-Regel zeigen
+    damit das LLM kein Rätselraten betreiben muss."""
+    # Ein Beispiel mit Container + Kontext muss vorhanden sein
+    has_container_example = (
+        ("Container" in THINKING_PROMPT and "Python" in THINKING_PROMPT)
+        or ("container" in THINKING_PROMPT.lower() and "gestern" in THINKING_PROMPT)
+    )
+    assert has_container_example, (
+        "THINKING_PROMPT fehlt ein konkretes Beispiel für kontextsensitive Tool-Anfrage "
+        "(z.B. 'starte Container für das Python-Projekt von gestern → needs_memory: true')."
+    )

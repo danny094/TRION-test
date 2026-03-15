@@ -80,10 +80,17 @@ Container Commander Tools:
 - "optimiere container" → ["optimize_container"]
 
 Runtime-Härtung (wichtig):
-- Runtime-/Tool-Anfragen (Container/Host/IP/Server/Blueprint/Skill/Cron/„nutze Tools“) sind ACTION:
+- Reine Runtime-/Tool-Anfragen OHNE Kontextbezug (Container/Host/IP/Server/Blueprint/Skill/Cron) sind ACTION:
   - needs_memory: false
   - is_fact_query: false
-- needs_memory darf NUR true sein bei explizitem Recall/Memory-Bedarf (z. B. "was weißt du", "erinnerst du").
+  Beispiel: “starte einen Ubuntu Container” → needs_memory: false ✓
+- AUSNAHME — needs_memory: true ist auch bei Tool-Anfragen erlaubt wenn der User sich auf
+  frühere Konversation oder persönliche Daten bezieht:
+  - Pronomen/Bezugswörter: “das Projekt”, “mein Script”, “unser Setup”, “die App”, “es”, “das”
+  - Zeitbezug: “von gestern”, “letzte Woche”, “vorhin”, “wie besprochen”, “wie wir besprochen haben”
+  - Explizite Erinnerungsanker: “das Python-Projekt”, “mein Docker-Setup”, “das wir gebaut haben”
+  Beispiel: “starte Container für das Python-Projekt von gestern” → needs_memory: true ✓
+  → memory_keys mit relevantem Projekt-/Kontext-Keys befüllen (z.B. [“python_project”, “last_container”])
 - Wenn needs_memory=true, dann memory_keys NICHT leer; sonst needs_memory=false setzen.
 - Nutze nur Tools aus "VERFÜGBARE TOOLS". Schlage keine nicht gelisteten Tools vor.
 - Wenn im Kontext aktive Container mit container_id stehen:
