@@ -27,6 +27,7 @@ Tool List:
   - container_inspect    → Detailed info about a specific container
   - autonomy_cron_*      → Manage autonomous cron schedules (user/TRION)
   - cron_reference_links_list → Read-only GitHub inspiration collections
+  - storage_provision_container → Atomic: scope + blueprint + optional start
 """
 
 import logging
@@ -247,6 +248,25 @@ TOOL_DEFINITIONS = [
                 "storage_scope": {
                     "type": "string",
                     "description": "Optional approved storage scope name for bind mounts.",
+                },
+                "mounts": {
+                    "type": "array",
+                    "description": (
+                        "Host→container mount mappings. Each entry: "
+                        "{host: '/abs/path', container: '/app/data', mode: 'rw', type: 'bind'}. "
+                        "Bind-mount host paths must be within an approved storage_scope. "
+                        "Use type='volume' for named Docker volumes (host = volume name)."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "host":      {"type": "string", "description": "Absolute host path or volume name"},
+                            "container": {"type": "string", "description": "Mount target inside container"},
+                            "mode":      {"type": "string", "enum": ["ro", "rw"], "default": "rw"},
+                            "type":      {"type": "string", "enum": ["bind", "volume"], "default": "bind"},
+                        },
+                        "required": ["host", "container"],
+                    },
                 },
                 "healthcheck": {
                     "type": "object",
@@ -474,6 +494,73 @@ TOOL_DEFINITIONS = [
             }
         }
     },
+    {
+        "name": "storage_provision_container",
+        "description": (
+            "Atomic: register a host path as approved storage scope, create a blueprint "
+            "with the correct host→container mount mapping, and optionally start the container. "
+            "Use this instead of the manual 3-step chain "
+            "(storage_scope_upsert → blueprint_create → request_container). "
+            "Requires: the host path must already exist (run storage_create_service_dir first if needed)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "blueprint_id": {
+                    "type": "string",
+                    "description": "Unique blueprint ID (e.g. 'my-python-service'). Also used as scope name.",
+                },
+                "image": {
+                    "type": "string",
+                    "description": "Trusted Docker image (e.g. 'python:3.12-slim').",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable blueprint name.",
+                },
+                "storage_host_path": {
+                    "type": "string",
+                    "description": "Absolute host path to mount (e.g. '/data/services/my-app'). Must already exist.",
+                },
+                "container_mount_path": {
+                    "type": "string",
+                    "description": "Where to mount the path inside the container (e.g. '/app/data').",
+                    "default": "/app/data",
+                },
+                "storage_mode": {
+                    "type": "string",
+                    "enum": ["ro", "rw"],
+                    "description": "Mount mode: 'rw' (read-write, default) or 'ro' (read-only).",
+                    "default": "rw",
+                },
+                "description": {"type": "string", "description": "What this blueprint is for."},
+                "memory_limit": {"type": "string", "description": "Memory limit (e.g. '512m').", "default": "512m"},
+                "cpu_limit": {"type": "string", "description": "CPU limit (e.g. '0.5').", "default": "0.5"},
+                "network": {
+                    "type": "string",
+                    "enum": ["none", "internal", "bridge", "full"],
+                    "default": "internal",
+                },
+                "environment": {
+                    "type": "object",
+                    "description": "Static env vars (supports vault://SECRET_NAME refs).",
+                    "additionalProperties": {"type": "string"},
+                },
+                "allowed_exec": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Allowed command prefixes for exec_in_container.",
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "auto_start": {
+                    "type": "boolean",
+                    "description": "If true, start the container immediately after creation (default: true).",
+                    "default": True,
+                },
+            },
+            "required": ["blueprint_id", "image", "name", "storage_host_path"],
+        },
+    },
 ]
 
 
@@ -543,6 +630,8 @@ def call_tool(tool_name: str, arguments: Dict[str, Any]) -> Any:
             return _tool_autonomy_cron_queue(arguments)
         elif tool_name == "cron_reference_links_list":
             return _tool_cron_reference_links_list(arguments)
+        elif tool_name == "storage_provision_container":
+            return _tool_storage_provision_container(arguments)
         else:
             return {"error": f"Unknown tool: {tool_name}"}
     except Exception as e:
@@ -842,6 +931,94 @@ def _tool_storage_scope_delete(args: dict) -> dict:
     return {"deleted": bool(deleted), "name": name}
 
 
+def _tool_storage_provision_container(args: dict) -> dict:
+    """Atomic: scope upsert → blueprint_create (with mount) → optional request_container."""
+    blueprint_id = str(args.get("blueprint_id") or "").strip()
+    storage_host_path = str(args.get("storage_host_path") or "").strip()
+
+    if not blueprint_id:
+        return {"error": "blueprint_id is required"}
+    if not storage_host_path:
+        return {"error": "storage_host_path is required"}
+    if not os.path.isabs(storage_host_path):
+        return {"error": f"storage_host_path must be an absolute path, got: '{storage_host_path}'"}
+    if not os.path.exists(storage_host_path):
+        return {
+            "error": f"storage_host_path '{storage_host_path}' does not exist. "
+                     "Run storage_create_service_dir first to create it."
+        }
+
+    container_mount_path = str(args.get("container_mount_path") or "/app/data").strip()
+    storage_mode = str(args.get("storage_mode") or "rw").strip().lower()
+    if storage_mode not in ("ro", "rw"):
+        return {"error": f"storage_mode must be 'ro' or 'rw', got: '{storage_mode}'"}
+
+    scope_name = f"{blueprint_id}_scope"
+
+    # Step 1: Register storage scope
+    try:
+        scope_result = _tool_storage_scope_upsert({
+            "name": scope_name,
+            "roots": [{"path": storage_host_path, "mode": storage_mode}],
+            "approved_by": "user",
+        })
+    except Exception as e:
+        return {"error": f"storage_scope_upsert failed: {e}"}
+
+    # Step 2: Create blueprint with mount
+    bp_args = {
+        "id": blueprint_id,
+        "image": args["image"],
+        "name": args["name"],
+        "description": args.get("description", ""),
+        "memory_limit": args.get("memory_limit", "512m"),
+        "cpu_limit": args.get("cpu_limit", "0.5"),
+        "network": args.get("network", "internal"),
+        "environment": args.get("environment", {}),
+        "allowed_exec": args.get("allowed_exec", []),
+        "tags": args.get("tags", []),
+        "storage_scope": scope_name,
+        "mounts": [
+            {"host": storage_host_path, "container": container_mount_path, "mode": storage_mode, "type": "bind"}
+        ],
+    }
+    bp_result = _tool_blueprint_create(bp_args)
+    if "error" in bp_result:
+        return {
+            "error": f"blueprint_create failed: {bp_result['error']}",
+            "scope_created": scope_result.get("stored", False),
+            "scope_name": scope_name,
+        }
+
+    # Step 3: Optionally start the container
+    auto_start = args.get("auto_start", True)
+    container_result: dict = {}
+    if auto_start:
+        container_result = _tool_request_container({"blueprint_id": blueprint_id})
+
+    result: dict = {
+        "provisioned": True,
+        "blueprint_id": blueprint_id,
+        "scope_name": scope_name,
+        "storage_host_path": storage_host_path,
+        "container_mount_path": container_mount_path,
+        "storage_mode": storage_mode,
+        "blueprint_created": bp_result.get("created", False),
+        "steps": {
+            "1_scope_upsert": "ok",
+            "2_blueprint_create": "ok",
+        },
+    }
+    if auto_start:
+        started = "container_id" in container_result and not container_result.get("error")
+        result["steps"]["3_container_start"] = "ok" if started else "failed"
+        if started:
+            result["container_id"] = container_result.get("container_id")
+        else:
+            result["start_error"] = container_result.get("error", "unknown")
+    return result
+
+
 def _tool_snapshot_list(args: dict) -> dict:
     from .volumes import list_snapshots
     snaps = list_snapshots(volume_name=args.get("volume_name"))
@@ -978,12 +1155,12 @@ def _ensure_trion_home() -> str:
 def _tool_blueprint_create(args: dict) -> dict:
     """Create a new blueprint from a trusted Docker image."""
     from .blueprint_store import create_blueprint, get_blueprint
-    from .models import Blueprint, ResourceLimits, NetworkMode
+    from .models import Blueprint, ResourceLimits, MountDef, NetworkMode
     from .trust import evaluate_blueprint_trust, is_trusted_image
-    
+
     image = args["image"]
     blueprint_id = args["id"]
-    
+
     # Security: Validate trusted image
     if not is_trusted_image(image):
         return {
@@ -1000,12 +1177,30 @@ def _tool_blueprint_create(args: dict) -> dict:
                 "josh5/steam-headless",
             ],
         }
-    
+
     # Check if blueprint already exists
     existing = get_blueprint(blueprint_id)
     if existing:
         return {"error": f"Blueprint '{blueprint_id}' already exists. Use a different ID."}
-    
+
+    # Parse mounts from args (new parameter: host→container mappings)
+    raw_mounts = args.get("mounts") or []
+    mounts: list = []
+    for m in raw_mounts:
+        if not isinstance(m, dict):
+            continue
+        host = str(m.get("host") or "").strip()
+        container = str(m.get("container") or "").strip()
+        if not host or not container:
+            return {"error": f"Invalid mount entry {m!r}: 'host' and 'container' are required."}
+        mode = str(m.get("mode") or "rw").strip().lower()
+        if mode not in ("ro", "rw"):
+            return {"error": f"Invalid mount mode '{mode}' for host='{host}'. Use 'ro' or 'rw'."}
+        mtype = str(m.get("type") or "bind").strip().lower()
+        if mtype not in ("bind", "volume"):
+            return {"error": f"Invalid mount type '{mtype}' for host='{host}'. Use 'bind' or 'volume'."}
+        mounts.append(MountDef(host=host, container=container, mode=mode, type=mtype))
+
     # Build blueprint
     bp = Blueprint(
         id=blueprint_id,
@@ -1022,6 +1217,7 @@ def _tool_blueprint_create(args: dict) -> dict:
         devices=args.get("devices", []),
         environment=args.get("environment", {}),
         storage_scope=args.get("storage_scope", ""),
+        mounts=mounts,
         healthcheck=args.get("healthcheck", {}),
         cap_add=args.get("cap_add", []),
         shm_size=args.get("shm_size", ""),
