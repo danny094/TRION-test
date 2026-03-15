@@ -497,11 +497,13 @@ TOOL_DEFINITIONS = [
     {
         "name": "storage_provision_container",
         "description": (
-            "Atomic: register a host path as approved storage scope, create a blueprint "
-            "with the correct host→container mount mapping, and optionally start the container. "
-            "Use this instead of the manual 3-step chain "
-            "(storage_scope_upsert → blueprint_create → request_container). "
-            "Requires: the host path must already exist (run storage_create_service_dir first if needed)."
+            "Atomic: create the host storage directory (if needed), register it as an approved "
+            "storage scope, create a blueprint with the correct host→container mount mapping, "
+            "and optionally start the container. "
+            "Use this instead of the manual chain "
+            "(storage_create_service_dir → storage_scope_upsert → blueprint_create → request_container). "
+            "The directory is auto-created with mode 0o750 if it does not exist — "
+            "use owner_uid/owner_gid so non-root container users can write to it."
         ),
         "inputSchema": {
             "type": "object",
@@ -520,7 +522,10 @@ TOOL_DEFINITIONS = [
                 },
                 "storage_host_path": {
                     "type": "string",
-                    "description": "Absolute host path to mount (e.g. '/data/services/my-app'). Must already exist.",
+                    "description": (
+                        "Absolute host path to mount (e.g. '/data/services/my-app'). "
+                        "Auto-created with mode 0o750 if it does not exist."
+                    ),
                 },
                 "container_mount_path": {
                     "type": "string",
@@ -532,6 +537,22 @@ TOOL_DEFINITIONS = [
                     "enum": ["ro", "rw"],
                     "description": "Mount mode: 'rw' (read-write, default) or 'ro' (read-only).",
                     "default": "rw",
+                },
+                "owner_uid": {
+                    "type": "integer",
+                    "description": (
+                        "UID to chown the directory to after creation. "
+                        "Set to the container's service user UID so non-root containers can write. "
+                        "Only applied when the directory is newly created. "
+                        "Example: 1000 for a typical non-root app user."
+                    ),
+                },
+                "owner_gid": {
+                    "type": "integer",
+                    "description": (
+                        "GID to chown the directory to after creation (defaults to owner_uid if omitted). "
+                        "Only applied when the directory is newly created."
+                    ),
                 },
                 "description": {"type": "string", "description": "What this blueprint is for."},
                 "memory_limit": {"type": "string", "description": "Memory limit (e.g. '512m').", "default": "512m"},
@@ -932,7 +953,7 @@ def _tool_storage_scope_delete(args: dict) -> dict:
 
 
 def _tool_storage_provision_container(args: dict) -> dict:
-    """Atomic: scope upsert → blueprint_create (with mount) → optional request_container."""
+    """Atomic: create dir → scope upsert → blueprint_create (with mount) → optional request_container."""
     blueprint_id = str(args.get("blueprint_id") or "").strip()
     storage_host_path = str(args.get("storage_host_path") or "").strip()
 
@@ -942,11 +963,6 @@ def _tool_storage_provision_container(args: dict) -> dict:
         return {"error": "storage_host_path is required"}
     if not os.path.isabs(storage_host_path):
         return {"error": f"storage_host_path must be an absolute path, got: '{storage_host_path}'"}
-    if not os.path.exists(storage_host_path):
-        return {
-            "error": f"storage_host_path '{storage_host_path}' does not exist. "
-                     "Run storage_create_service_dir first to create it."
-        }
 
     container_mount_path = str(args.get("container_mount_path") or "/app/data").strip()
     storage_mode = str(args.get("storage_mode") or "rw").strip().lower()
@@ -954,6 +970,31 @@ def _tool_storage_provision_container(args: dict) -> dict:
         return {"error": f"storage_mode must be 'ro' or 'rw', got: '{storage_mode}'"}
 
     scope_name = f"{blueprint_id}_scope"
+
+    # Step 0: Ensure host directory exists with correct ownership.
+    # Docker auto-creates missing bind-mount dirs as root:root which breaks non-root containers.
+    dir_created = False
+    dir_chowned = False
+    if not os.path.exists(storage_host_path):
+        try:
+            os.makedirs(storage_host_path, mode=0o750, exist_ok=True)
+            dir_created = True
+            logger.info(f"[provision] Created storage dir: {storage_host_path} (mode=0o750)")
+        except Exception as e:
+            return {"error": f"Failed to create storage_host_path '{storage_host_path}': {e}"}
+
+    # Optional chown so non-root container users can write.
+    owner_uid = args.get("owner_uid")
+    owner_gid = args.get("owner_gid")
+    if owner_uid is not None and dir_created:
+        try:
+            uid = int(owner_uid)
+            gid = int(owner_gid) if owner_gid is not None else uid
+            os.chown(storage_host_path, uid, gid)
+            dir_chowned = True
+            logger.info(f"[provision] chown {storage_host_path} → uid={uid} gid={gid}")
+        except Exception as e:
+            logger.warning(f"[provision] chown failed for '{storage_host_path}': {e}")
 
     # Step 1: Register storage scope
     try:
@@ -1005,10 +1046,13 @@ def _tool_storage_provision_container(args: dict) -> dict:
         "storage_mode": storage_mode,
         "blueprint_created": bp_result.get("created", False),
         "steps": {
+            "0_dir_create": "created" if dir_created else "already_existed",
             "1_scope_upsert": "ok",
             "2_blueprint_create": "ok",
         },
     }
+    if dir_chowned:
+        result["steps"]["0_dir_create"] = "created+chowned"
     if auto_start:
         started = "container_id" in container_result and not container_result.get("error")
         result["steps"]["3_container_start"] = "ok" if started else "failed"

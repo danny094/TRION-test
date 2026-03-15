@@ -162,10 +162,14 @@ def test_storage_provision_container_validates_absolute_path():
     assert "os.path.isabs(storage_host_path)" in src
 
 
-def test_storage_provision_container_checks_path_exists():
+def test_storage_provision_container_autocreates_missing_dir():
+    """storage_provision_container must auto-create missing dirs instead of failing."""
     src = _mcp_src()
-    assert "os.path.exists(storage_host_path)" in src
-    assert "storage_create_service_dir" in src  # hint in error message
+    impl = src.split("def _tool_storage_provision_container")[1].split("def _tool_snapshot_list")[0]
+    assert "os.makedirs(storage_host_path" in impl
+    assert "os.path.exists(storage_host_path)" in impl
+    # Should NOT hard-fail with "does not exist" message
+    assert "does not exist" not in impl
 
 
 def test_storage_provision_container_uses_scope_upsert():
@@ -192,17 +196,55 @@ def test_storage_provision_container_auto_start_calls_request_container():
     assert "auto_start" in impl
 
 
-def test_storage_provision_container_runtime_missing_path(tmp_path):
-    """Returns error when storage_host_path does not exist."""
+def test_storage_provision_container_runtime_autocreates_missing_path(tmp_path):
+    """Auto-creates the host path when it doesn't exist (no error, no dry_run trap)."""
     import container_commander.mcp_tools as tools
-    result = tools._tool_storage_provision_container({
-        "blueprint_id": "test-bp",
-        "image": "python:3.12-slim",
-        "name": "Test",
-        "storage_host_path": str(tmp_path / "nonexistent"),
-    })
-    assert "error" in result
-    assert "does not exist" in result["error"]
+
+    new_path = str(tmp_path / "new-service")
+    assert not os.path.exists(new_path)
+
+    def fake_scope_upsert(a): return {"stored": True}
+    def fake_bp_create(a): return {"created": True, "blueprint_id": a["id"]}
+    def fake_request_container(a): return {"container_id": "abc123"}
+
+    with patch.object(tools, "_tool_storage_scope_upsert", fake_scope_upsert), \
+         patch.object(tools, "_tool_blueprint_create", fake_bp_create), \
+         patch.object(tools, "_tool_request_container", fake_request_container):
+
+        result = tools._tool_storage_provision_container({
+            "blueprint_id": "test-bp",
+            "image": "python:3.12-slim",
+            "name": "Test",
+            "storage_host_path": new_path,
+        })
+
+    assert "error" not in result
+    assert result.get("provisioned") is True
+    assert os.path.exists(new_path), "Directory must be created automatically"
+    assert result["steps"]["0_dir_create"] == "created"
+
+
+def test_storage_provision_container_dir_already_exists_no_error(tmp_path):
+    """Existing path is accepted as-is (step shows 'already_existed')."""
+    import container_commander.mcp_tools as tools
+
+    def fake_scope_upsert(a): return {"stored": True}
+    def fake_bp_create(a): return {"created": True, "blueprint_id": a["id"]}
+    def fake_request_container(a): return {"container_id": "xyz"}
+
+    with patch.object(tools, "_tool_storage_scope_upsert", fake_scope_upsert), \
+         patch.object(tools, "_tool_blueprint_create", fake_bp_create), \
+         patch.object(tools, "_tool_request_container", fake_request_container):
+
+        result = tools._tool_storage_provision_container({
+            "blueprint_id": "existing-bp",
+            "image": "python:3.12-slim",
+            "name": "Existing",
+            "storage_host_path": str(tmp_path),
+        })
+
+    assert "error" not in result
+    assert result["steps"]["0_dir_create"] == "already_existed"
 
 
 def test_storage_provision_container_runtime_relative_path():
@@ -258,6 +300,7 @@ def test_storage_provision_container_runtime_happy_path(tmp_path):
     assert result.get("blueprint_id") == "my-service"
     assert result.get("scope_name") == "my-service_scope"
     assert result.get("container_id") == "abc123"
+    assert result["steps"]["0_dir_create"] == "already_existed"
     assert result["steps"]["1_scope_upsert"] == "ok"
     assert result["steps"]["2_blueprint_create"] == "ok"
     assert result["steps"]["3_container_start"] == "ok"
@@ -307,6 +350,7 @@ def test_storage_provision_container_runtime_no_auto_start(tmp_path):
 
     assert result.get("provisioned") is True
     assert "3_container_start" not in result["steps"]
+    assert result["steps"]["0_dir_create"] == "already_existed"
     assert len(rc_calls) == 0
 
 
@@ -330,3 +374,155 @@ def test_storage_provision_container_propagates_blueprint_error(tmp_path):
     assert "blueprint_create failed" in result["error"]
     assert result.get("scope_created") is True  # scope was created before blueprint failed
     assert result.get("scope_name") == "bad-service_scope"
+
+
+# ── Fix: owner_uid/owner_gid schema ─────────────────────
+
+def test_storage_provision_container_schema_has_owner_uid_gid():
+    """Schema must expose owner_uid and owner_gid parameters."""
+    src = _mcp_src()
+    assert '"owner_uid"' in src
+    assert '"owner_gid"' in src
+
+
+def test_storage_provision_container_owner_uid_applies_chown(tmp_path):
+    """When owner_uid is given and dir is created, chown must be called."""
+    import container_commander.mcp_tools as tools
+
+    new_path = str(tmp_path / "chown-service")
+    chown_calls = []
+
+    def fake_makedirs(path, mode=0o777, exist_ok=False):
+        os.makedirs(path, mode=mode, exist_ok=exist_ok)
+
+    def fake_chown(path, uid, gid):
+        chown_calls.append((path, uid, gid))
+
+    with patch("os.chown", fake_chown), \
+         patch.object(tools, "_tool_storage_scope_upsert", lambda a: {"stored": True}), \
+         patch.object(tools, "_tool_blueprint_create", lambda a: {"created": True, "blueprint_id": a["id"]}), \
+         patch.object(tools, "_tool_request_container", lambda a: {"container_id": "c1"}):
+
+        result = tools._tool_storage_provision_container({
+            "blueprint_id": "chown-service",
+            "image": "python:3.12-slim",
+            "name": "Chown Test",
+            "storage_host_path": new_path,
+            "owner_uid": 1000,
+            "owner_gid": 1000,
+        })
+
+    assert "error" not in result
+    assert len(chown_calls) == 1
+    assert chown_calls[0] == (new_path, 1000, 1000)
+    assert result["steps"]["0_dir_create"] == "created+chowned"
+
+
+def test_storage_provision_container_chown_not_called_for_existing_dir(tmp_path):
+    """chown must NOT be called when the directory already exists."""
+    import container_commander.mcp_tools as tools
+
+    chown_calls = []
+
+    with patch("os.chown", lambda *a: chown_calls.append(a)), \
+         patch.object(tools, "_tool_storage_scope_upsert", lambda a: {"stored": True}), \
+         patch.object(tools, "_tool_blueprint_create", lambda a: {"created": True, "blueprint_id": a["id"]}), \
+         patch.object(tools, "_tool_request_container", lambda a: {"container_id": "c2"}):
+
+        result = tools._tool_storage_provision_container({
+            "blueprint_id": "existing-service",
+            "image": "python:3.12-slim",
+            "name": "Existing",
+            "storage_host_path": str(tmp_path),  # already exists
+            "owner_uid": 1000,
+        })
+
+    assert len(chown_calls) == 0  # dir existed → no chown
+    assert result["steps"]["0_dir_create"] == "already_existed"
+
+
+# ── Fix: Engine guard — ensure_bind_mount_host_dirs (mount_utils.py) ────
+
+def test_engine_guard_function_in_mount_utils():
+    """ensure_bind_mount_host_dirs must exist in mount_utils.py (no docker dep)."""
+    root = Path(__file__).resolve().parents[2]
+    src = (root / "container_commander/mount_utils.py").read_text(encoding="utf-8")
+    assert "def ensure_bind_mount_host_dirs" in src
+
+
+def test_engine_calls_mount_utils_guard():
+    """engine.py must import and call ensure_bind_mount_host_dirs from mount_utils."""
+    root = Path(__file__).resolve().parents[2]
+    src = (root / "container_commander/engine.py").read_text(encoding="utf-8")
+    assert "ensure_bind_mount_host_dirs(bp.mounts)" in src
+    assert "mount_utils" in src
+
+
+def test_engine_guard_only_processes_bind_mounts():
+    """ensure_bind_mount_host_dirs must skip 'volume' type mounts."""
+    root = Path(__file__).resolve().parents[2]
+    src = (root / "container_commander/mount_utils.py").read_text(encoding="utf-8")
+    assert '!= "bind"' in src
+
+
+def test_engine_guard_creates_missing_dir_with_safe_mode(tmp_path):
+    """ensure_bind_mount_host_dirs creates missing dirs with mode 0o750."""
+    from types import SimpleNamespace
+    from container_commander.mount_utils import ensure_bind_mount_host_dirs
+
+    new_dir = tmp_path / "missing-bind"
+    assert not new_dir.exists()
+
+    mounts = [SimpleNamespace(host=str(new_dir), container="/app/data", mode="rw", type="bind")]
+    ensure_bind_mount_host_dirs(mounts)
+
+    assert new_dir.exists()
+    stat = new_dir.stat()
+    assert stat.st_mode & 0o777 <= 0o755, f"Mode {oct(stat.st_mode & 0o777)} is too permissive"
+
+
+def test_engine_guard_leaves_existing_dir_untouched(tmp_path):
+    """ensure_bind_mount_host_dirs must not modify existing directories."""
+    from types import SimpleNamespace
+    from container_commander.mount_utils import ensure_bind_mount_host_dirs
+
+    existing = tmp_path / "existing"
+    existing.mkdir(mode=0o700)
+    original_mode = existing.stat().st_mode
+
+    mounts = [SimpleNamespace(host=str(existing), container="/data", mode="rw", type="bind")]
+    ensure_bind_mount_host_dirs(mounts)
+
+    assert existing.stat().st_mode == original_mode  # untouched
+
+
+def test_engine_guard_skips_volume_type_mounts(tmp_path):
+    """ensure_bind_mount_host_dirs must not create dirs for 'volume' type mounts."""
+    from types import SimpleNamespace
+    from container_commander.mount_utils import ensure_bind_mount_host_dirs
+
+    phantom = tmp_path / "phantom-volume"
+    mounts = [SimpleNamespace(host=str(phantom), container="/data", mode="rw", type="volume")]
+    ensure_bind_mount_host_dirs(mounts)
+
+    assert not phantom.exists()  # volume type → not created
+
+
+def test_engine_guard_logs_warning_on_makedirs_failure(caplog):
+    """ensure_bind_mount_host_dirs logs a warning if mkdir fails (e.g. permission denied)."""
+    from types import SimpleNamespace
+    from container_commander.mount_utils import ensure_bind_mount_host_dirs
+    import logging
+
+    impossible_path = "/root/trion_test_guard_no_permission"
+    mounts = [SimpleNamespace(host=impossible_path, container="/data", mode="rw", type="bind")]
+
+    with caplog.at_level(logging.WARNING, logger="container_commander.mount_utils"):
+        try:
+            ensure_bind_mount_host_dirs(mounts)
+        except Exception:
+            pass
+
+    if not os.path.exists(impossible_path):
+        assert any("Could not" in r.message for r in caplog.records), \
+            "Expected a 'Could not pre-create' warning when mkdir fails"

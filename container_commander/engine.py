@@ -226,6 +226,13 @@ def start_container(
     if not mounts_ok:
         raise RuntimeError(mounts_reason)
 
+    # Pre-create missing bind-mount host dirs before docker run.
+    # Docker daemon auto-creates missing dirs as root:root, which causes
+    # Permission Denied for non-root container users. We create them first
+    # (as the current process user, mode 0o750) to prevent that.
+    from .mount_utils import ensure_bind_mount_host_dirs
+    ensure_bind_mount_host_dirs(bp.mounts)
+
     _emit_ws_activity(
         "deploy_start",
         level="info",
