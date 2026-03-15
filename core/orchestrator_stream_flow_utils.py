@@ -615,6 +615,7 @@ async def process_stream_with_events(
     if skip_control:
         verified_plan = thinking_plan.copy()
         verified_plan["_skipped"] = True
+        verified_plan["_skip_reason"] = str(_skip_reason_stream or "low_risk_skip")
         verification = {
             "approved": True,
             "hard_block": False,

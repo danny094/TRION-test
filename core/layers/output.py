@@ -637,6 +637,25 @@ class OutputLayer:
                 "policy": output_cfg,
             }
 
+        # INV-08 Fix: pending_approval is a normal async workflow state, not a tech failure.
+        # Container approval flows produce status=pending_approval — grounding must not
+        # treat this as missing evidence and emit the generic fallback text.
+        _has_pending_approval = any(
+            str((e or {}).get("status") or "").strip().lower() == "pending_approval"
+            for e in (evidence or [])
+            if isinstance(e, dict)
+        )
+        if _has_pending_approval and require_evidence and successful_extractable < min_successful:
+            return {
+                "blocked": False,
+                "blocked_reason": "pending_approval",
+                "mode": "pass",
+                "response": "",
+                "evidence": evidence,
+                "is_fact_query": is_fact_query,
+                "policy": output_cfg,
+            }
+
         if require_evidence and successful_extractable < min_successful:
             self._set_runtime_grounding_value(
                 verified_plan, execution_result, "missing_evidence", True, legacy_key="_grounding_missing_evidence"

@@ -228,6 +228,58 @@ def persist_execution_result(plan: Optional[MutableMapping[str, Any]], result: E
     plan["_execution_result"] = result.to_dict()
 
 
+class ControlContractError(ValueError):
+    """Raised when a plan-state invariant is violated."""
+
+
+VALID_SKIP_REASONS: Tuple[str, ...] = (
+    "low_risk_skip",
+    "control_disabled",
+    "fact_query_requires_control",
+    "hardware_gate_requires_control",
+    "control_required",
+    "sensitive_tools",
+    "creation_keywords",
+    "hard_safety_keywords",
+)
+
+
+def persist_skip_state(plan: MutableMapping[str, Any], skip_reason: str) -> None:
+    """Set _skipped=True in plan. Raises ControlContractError if skip_reason is empty.
+
+    INV-10: _skipped=True without _skip_reason is an illegal plan state.
+    All code paths that skip Control must call this instead of setting fields directly.
+    """
+    if not isinstance(plan, dict):
+        raise ControlContractError("plan must be a MutableMapping")
+    reason = str(skip_reason or "").strip()
+    if not reason:
+        raise ControlContractError(
+            "INV-10: skip_reason must be non-empty when _skipped=True. "
+            "Pass a reason from VALID_SKIP_REASONS."
+        )
+    plan["_skipped"] = True
+    plan["_skip_reason"] = reason
+
+
+def persist_gate_blocked_state(plan: MutableMapping[str, Any], intent: str, gate_reason: str = "") -> None:
+    """Set _blueprint_gate_blocked=True in plan. Raises ControlContractError if intent is empty.
+
+    INV-11: _blueprint_gate_blocked=True without intent is an illegal plan state.
+    Gate is only valid after ThinkingLayer has produced an intent.
+    """
+    if not isinstance(plan, dict):
+        raise ControlContractError("plan must be a MutableMapping")
+    if not str(intent or "").strip():
+        raise ControlContractError(
+            "INV-11: intent must be non-empty when _blueprint_gate_blocked=True. "
+            "Gate must only be set after ThinkingLayer has produced an intent."
+        )
+    plan["_blueprint_gate_blocked"] = True
+    if gate_reason:
+        plan["_blueprint_gate_reason"] = str(gate_reason).strip()
+
+
 def control_decision_from_plan(
     plan: Optional[Mapping[str, Any]],
     *,

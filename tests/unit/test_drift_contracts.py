@@ -40,10 +40,13 @@ sys.path.insert(0, ROOT)
 
 from core.control_contract import (
     ControlDecision,
+    ControlContractError,
     ExecutionResult,
     DoneReason,
     control_decision_from_plan,
     persist_control_decision,
+    persist_skip_state,
+    persist_gate_blocked_state,
     execution_result_from_plan,
 )
 
@@ -517,8 +520,8 @@ class TestINV08PendingApprovalNotFallback:
 
     def test_pending_approval_should_not_produce_fallback_text(self):
         """
-        INV-08: pending_approval → Output soll Approval-Dialog beschreiben,
-        nicht den generischen Fallback-Text ausgeben.
+        INV-08: pending_approval → Output darf keinen Fallback-Text ausgeben.
+        pending_approval ist ein normaler Workflow-Zustand — grounding muss pass-through liefern.
         """
         from core.layers.output import OutputLayer
 
@@ -526,15 +529,15 @@ class TestINV08PendingApprovalNotFallback:
         layer = OutputLayer()
         result = layer._grounding_precheck(plan, memory_data="")
 
-        if result.get("mode") in ("missing_evidence_fallback", "tool_execution_failed_fallback"):
-            fallback_response = result.get("response", "")
-            if FALLBACK_TEXT in fallback_response:
-                pytest.xfail(
-                    "DRIFT A2/INV-08 AKTIV: pending_approval erzeugt Fallback-Text. "
-                    "Fix: pending_approval muss als eigene Evidence-Klasse behandelt werden, "
-                    "nicht als 'fehlende Evidence'. "
-                    f"Aktueller mode: {result['mode']}"
-                )
+        # INV-08 Fix: pending_approval muss als pass-through behandelt werden
+        fallback_response = result.get("response", "")
+        assert FALLBACK_TEXT not in fallback_response, (
+            f"INV-08 VERLETZT: pending_approval erzeugt Fallback-Text. mode={result.get('mode')}"
+        )
+        # pending_approval darf kein hard-block sein
+        assert result.get("blocked") is not True, (
+            f"INV-08 VERLETZT: pending_approval blockiert den Output. mode={result.get('mode')}"
+        )
 
     def test_pending_approval_result_structure(self):
         """pending_approval hat korrekte Felder im Tool-Result."""
@@ -562,19 +565,10 @@ class TestINV10SkipReasonAlwaysSet:
         assert plan.get("_skip_reason") in VALID_SKIP_REASONS
 
     def test_skip_without_reason_is_invalid(self):
-        """Skipped=True ohne skip_reason → Contract-Verletzung."""
-        plan = make_verified_plan(skipped=True, skip_reason=None)
-        # Manuell _skip_reason entfernen um den Fehlerfall zu simulieren
-        plan.pop("_skip_reason", None)
-
-        is_skipped = bool(plan.get("_skipped"))
-        has_skip_reason = bool(plan.get("_skip_reason"))
-
-        if is_skipped and not has_skip_reason:
-            pytest.xfail(
-                "INV-10 VERLETZT: _skipped=True ohne _skip_reason. "
-                "Fix: Orchestrator muss immer _skip_reason setzen wenn _skipped=True."
-            )
+        """Skipped=True ohne skip_reason → persist_skip_state muss ControlContractError werfen."""
+        plan: Dict[str, Any] = {}
+        with pytest.raises(ControlContractError, match="INV-10"):
+            persist_skip_state(plan, "")
 
     @pytest.mark.parametrize("reason", list(VALID_SKIP_REASONS))
     def test_all_valid_skip_reasons_accepted(self, reason):
@@ -595,17 +589,10 @@ class TestINV11GateBlockedRequiresIntent:
         assert plan.get("intent")
 
     def test_gate_blocked_without_intent_is_invalid(self):
-        plan = make_verified_plan(gate_blocked=True, intent="")
-        plan["intent"] = ""  # leerer Intent
-
-        gate_blocked = bool(plan.get("_blueprint_gate_blocked"))
-        has_intent = bool(plan.get("intent"))
-
-        if gate_blocked and not has_intent:
-            pytest.xfail(
-                "INV-11 VERLETZT: _blueprint_gate_blocked=True ohne intent. "
-                "Fix: Gate darf nur nach Thinking gesetzt werden."
-            )
+        """gate_blocked ohne intent → persist_gate_blocked_state muss ControlContractError werfen."""
+        plan: Dict[str, Any] = {}
+        with pytest.raises(ControlContractError, match="INV-11"):
+            persist_gate_blocked_state(plan, intent="")
 
 
 # ═══════════════════════════════════════════════════════════════════
